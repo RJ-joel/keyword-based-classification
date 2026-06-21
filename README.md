@@ -62,8 +62,6 @@ project/
 
 ├── requirements.txt
 
-├── processing.log
-
 └── README.md
 
 ## Installation
