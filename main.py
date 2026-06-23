@@ -1,9 +1,12 @@
 import logging
+import os
 import shutil
 from pathlib import Path
 
+from PyPDF2.errors import PdfReadError
+
 from classifier import classify_text
-from pdf_reader import extract_text
+from pdf_reader import EncryptedPdfError, extract_text
 
 BASE_DIR = Path(__file__).parent
 INPUT_DIR = BASE_DIR / "input"
@@ -12,41 +15,106 @@ CATEGORIES = ("Math", "Science", "English", "Unknown")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(message)s"
+    format="%(levelname)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
 
 
-def get_unique_destination(category: str, file_name: str) -> Path:
+def reserve_unique_destination(category: str, source_file: Path) -> Path:
     """
-    Prevents overwriting when a file with the same name
-    already exists in an output folder.
+    Atomically reserve a unique output filename.
+
+    O_CREAT | O_EXCL ensures that two program instances cannot reserve
+    the same filename.
     """
-    category_dir = OUTPUT_DIR / category
-    original_path = category_dir / file_name
+    output_folder = OUTPUT_DIR / category
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-    if not original_path.exists():
-        return original_path
-
-    file_path = Path(file_name)
-    counter = 1
+    counter = 0
 
     while True:
-        new_name = f"{file_path.stem}_{counter}{file_path.suffix}"
-        new_path = category_dir / new_name
+        if counter == 0:
+            filename = source_file.name
+        else:
+            filename = (
+                f"{source_file.stem}_{counter}{source_file.suffix}"
+            )
 
-        if not new_path.exists():
-            return new_path
+        destination = output_folder / filename
 
-        counter += 1
+        try:
+            file_descriptor = os.open(
+                destination,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            )
+        except FileExistsError:
+            counter += 1
+            continue
+
+        os.close(file_descriptor)
+        return destination
 
 
-def process_pdfs():
+def move_to_reserved_destination(
+    source_file: Path,
+    destination: Path,
+) -> None:
+    """
+    Copy to the atomically reserved file, then remove the source.
+
+    This avoids filename collisions even when multiple processes run
+    at the same time.
+    """
+    try:
+        shutil.copy2(source_file, destination)
+        source_file.unlink()
+    except OSError:
+        # Remove the empty/reserved destination if transfer failed.
+        if destination.exists():
+            destination.unlink()
+        raise
+
+
+def process_pdf(pdf_file: Path) -> None:
+    try:
+        extracted_text = extract_text(pdf_file)
+        category = classify_text(extracted_text)
+
+        if not extracted_text.strip():
+            logger.info("%s has no extractable text.", pdf_file.name)
+
+    except (PdfReadError, EncryptedPdfError) as error:
+        # Known PDF-specific problems are safely routed to Unknown.
+        category = "Unknown"
+        logger.warning("%s: %s", pdf_file.name, error)
+
+    except OSError as error:
+        # Example: unreadable file or insufficient file permissions.
+        logger.error("Could not read %s: %s", pdf_file.name, error)
+        return
+
+    destination = reserve_unique_destination(category, pdf_file)
+
+    try:
+        move_to_reserved_destination(pdf_file, destination)
+    except OSError:
+        logger.exception("Could not move %s", pdf_file.name)
+        return
+
+    if destination.name == pdf_file.name:
+        logger.info("%s -> %s", pdf_file.name, category)
+    else:
+        logger.info(
+            "%s -> %s (saved as %s)",
+            pdf_file.name,
+            category,
+            destination.name,
+        )
+
+
+def main() -> None:
     INPUT_DIR.mkdir(exist_ok=True)
 
-    for category in CATEGORIES:
-        (OUTPUT_DIR / category).mkdir(parents=True, exist_ok=True)
-
-    # Supports names such as document.pdf and document.PDF
     pdf_files = [
         file
         for file in INPUT_DIR.iterdir()
@@ -54,39 +122,12 @@ def process_pdfs():
     ]
 
     if not pdf_files:
-        logging.info("No PDF files found in input folder.")
+        logger.info("No PDF files found in input folder.")
         return
 
     for pdf_file in pdf_files:
-        try:
-            text = extract_text(pdf_file)
-            category = classify_text(text)
-
-            # Empty or scanned PDFs have no extractable text.
-            if not text.strip():
-                logging.info(f"{pdf_file.name} has no extractable text.")
-
-        except Exception as error:
-            # Corrupt/password-protected PDFs are safely sent to Unknown.
-            category = "Unknown"
-            logging.warning(f"{pdf_file.name}: could not read PDF ({error})")
-
-        destination = get_unique_destination(category, pdf_file.name)
-
-        try:
-            shutil.move(str(pdf_file), str(destination))
-
-            if destination.name != pdf_file.name:
-                logging.info(
-                    f"{pdf_file.name} -> {category} "
-                    f"(saved as {destination.name})"
-                )
-            else:
-                logging.info(f"{pdf_file.name} -> {category}")
-
-        except OSError as error:
-            logging.error(f"Could not move {pdf_file.name}: {error}")
+        process_pdf(pdf_file)
 
 
 if __name__ == "__main__":
-    process_pdfs()
+    main()

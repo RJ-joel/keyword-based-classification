@@ -1,15 +1,36 @@
+from pathlib import Path
+from typing import Union
+
 from PyPDF2 import PdfReader
+from PyPDF2.errors import PdfReadError
 
 
-def extract_text(pdf_path: str) -> str:
-    reader = PdfReader(pdf_path)
+class EncryptedPdfError(Exception):
+    """Raised when an encrypted PDF cannot be opened with a blank password."""
 
-    # Try opening PDFs that have an empty password.
-    if reader.is_encrypted:
-        if reader.decrypt("") == 0:
-            raise ValueError("PDF is encrypted and requires a password")
 
-    return "\n".join(
-        page.extract_text() or ""
-        for page in reader.pages
-    )
+def extract_text(pdf_path: Union[str, Path]) -> str:
+    """
+    Extract text from a PDF and always close its file handle afterward.
+    """
+    path = Path(pdf_path)
+
+    with path.open("rb") as pdf_file:
+        reader = PdfReader(pdf_file)
+
+        if reader.is_encrypted:
+            # PyPDF2 3.0.1 returns 0 when blank-password decryption fails.
+            decrypted = reader.decrypt("")
+
+            if decrypted == 0:
+                raise EncryptedPdfError(
+                    "PDF is encrypted and requires a password."
+                )
+
+        try:
+            return "\n".join(
+                page.extract_text() or ""
+                for page in reader.pages
+            )
+        except PdfReadError:
+            raise
